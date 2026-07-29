@@ -1,0 +1,218 @@
+"""
+build_table2.py
+================
+Generates a Table 1/2-style descriptive statistics table with grouped
+columns (HAI+/HAI-, Exposure Status, ADRD+/ADRD-) and demographic /
+clinical rows (race, ADRD status, sex, age bands, SVI, urbanicity,
+hospital size).
+
+HOW TO USE
+----------
+1. Load your real dataframe (`df = pd.read_csv(...)` etc.).
+2. Edit COLUMN_MAP below so the keys point at YOUR dataframe's actual
+   column names / category labels.
+3. Edit the SVI and hospital-size cut points to match your definitions.
+4. Run the script. It prints the table and writes it to
+   'table2_descriptive_stats.xlsx' and '.csv'.
+
+A synthetic dataset is generated automatically if you run this file
+directly, so you can see the expected output shape before wiring in
+real data.
+"""
+
+import numpy as np
+import pandas as pd
+
+pd.set_option("display.width", 160)
+pd.set_option("display.max_columns", 20)
+
+# ---------------------------------------------------------------------
+# 1. CONFIG — edit this section to match your dataframe
+# ---------------------------------------------------------------------
+
+COLUMN_MAP = {
+    "hai_status": "hai_status",        # values expected: "positive" / "negative"
+    "exposure": "exposure_type",       # values expected: "c_diff" / "mrsa" / other
+    "adrd": "adrd_status",             # values expected: "positive" / "negative"
+    "race_ethnicity": "race_ethnicity",  # values expected: "White" / "Non-White"
+    "sex": "sex",                      # values expected: "Female" / "Male"
+    "age": "age",                      # numeric, years
+    "svi": "svi_score",                # numeric, 0-1
+    "urban": "urban_hospital",         # boolean / 1-0
+    "hospital_size": "hospital_beds",  # numeric bed count
+}
+
+# SVI cut points (edit to your study's definition)
+SVI_HIGH_CUTOFF = 0.75   # >= this  -> High
+SVI_LOW_CUTOFF = 0.25    # <= this  -> Low ; between -> Medium
+
+# Hospital size bins (edit bed-count cut points / labels)
+HOSPITAL_SIZE_BINS = [0, 99, 249, 499, np.inf]
+HOSPITAL_SIZE_LABELS = ["Bin 1 (<100 beds)", "Bin 2 (100-249)",
+                         "Bin 3 (250-499)", "Bin 4 (500+)"]
+
+AGE_BINS = [18, 35, 50, 65, 80, np.inf]
+AGE_LABELS = ["18-34", "35-49", "50-64", "65-79", "80+"]
+
+
+# ---------------------------------------------------------------------
+# 2. Helper functions
+# ---------------------------------------------------------------------
+
+def n_pct(mask_within_col: pd.Series, mask_row: pd.Series) -> str:
+    """Return 'n (pct%)' of rows satisfying mask_row, among mask_within_col."""
+    denom = mask_within_col.sum()
+    if denom == 0:
+        return "0 (0.0%)"
+    numer = (mask_within_col & mask_row).sum()
+    pct = 100 * numer / denom
+    return f"{numer} ({pct:.1f}%)"
+
+
+def build_column_groups(df: pd.DataFrame) -> dict:
+    """Return an ordered dict of {(group_label, col_label): boolean_mask}.
+
+    Matches the target table layout exactly:
+      HAI +            -> Overall | C. difficile | MRSA | Total
+      HAI -             -> single column, no subcolumns
+      Exposure Status   -> ADRD+ | ADRD-
+    """
+    c = COLUMN_MAP
+    hai = df[c["hai_status"]]
+    exposure = df[c["exposure"]]
+    adrd = df[c["adrd"]]
+
+    hai_pos = hai.eq("positive")
+
+    groups = {
+        ("HAI +", "Overall"): hai_pos,
+        ("HAI +", "C. difficile"): hai_pos & exposure.eq("c_diff"),
+        ("HAI +", "MRSA"): hai_pos & exposure.eq("mrsa"),
+        ("HAI +", "Total"): hai_pos & exposure.isin(["c_diff", "mrsa"]),
+        ("HAI -", ""): hai.eq("negative"),
+        ("Exposure Status", "ADRD+"): adrd.eq("positive"),
+        ("Exposure Status", "ADRD-"): adrd.eq("negative"),
+    }
+    return groups
+
+
+def build_table(df: pd.DataFrame) -> pd.DataFrame:
+    c = COLUMN_MAP
+    col_groups = build_column_groups(df)
+    col_index = pd.MultiIndex.from_tuples(col_groups.keys(),
+                                           names=["Group", "Column"])
+
+    # Precompute derived columns
+    race = df[c["race_ethnicity"]]
+    sex = df[c["sex"]]
+    adrd = df[c["adrd"]]
+    age_band = pd.cut(df[c["age"]], bins=AGE_BINS, labels=AGE_LABELS,
+                       right=False)
+    svi = df[c["svi"]]
+    svi_band = np.select(
+        [svi >= SVI_HIGH_CUTOFF, svi <= SVI_LOW_CUTOFF],
+        ["High", "Low"],
+        default="Medium",
+    )
+    svi_band = pd.Series(svi_band, index=df.index)
+    urban = df[c["urban"]].astype(bool)
+    hosp_bin = pd.cut(df[c["hospital_size"]], bins=HOSPITAL_SIZE_BINS,
+                       labels=HOSPITAL_SIZE_LABELS, right=True)
+
+    # Row definitions: (section, label, boolean mask)
+    rows = [
+        ("Patient Demographics", None, None),  # section header
+        ("Race/Ethnicity", None, None),
+        ("  White, n (%)", None, race.eq("White")),
+        ("  Non-White, n (%)", None, race.eq("Non-White")),
+        ("ADRD Status", None, None),
+        ("  ADRD+", None, adrd.eq("positive")),
+        ("  ADRD-", None, adrd.eq("negative")),
+        ("Female, n (%)", None, sex.eq("Female")),
+        ("Age, years", None, None),
+    ]
+    for lbl in AGE_LABELS:
+        rows.append((f"  {lbl}, n (%)", None, age_band.eq(lbl)))
+
+    rows += [
+        ("SVI Score", None, None),
+        (f"  High (>={SVI_HIGH_CUTOFF})", None, svi_band.eq("High")),
+        (f"  Medium ({SVI_LOW_CUTOFF}-{SVI_HIGH_CUTOFF})", None, svi_band.eq("Medium")),
+        (f"  Low (<={SVI_LOW_CUTOFF})", None, svi_band.eq("Low")),
+        ("Urban Hospital, n (%)", None, urban.eq(True)),
+        ("Hospital Size", None, None),
+    ]
+    for lbl in HOSPITAL_SIZE_LABELS:
+        rows.append((f"  {lbl}, n (%)", None, hosp_bin.eq(lbl)))
+
+    # Build output rows
+    out_rows = []
+    row_labels = []
+    for label, _, mask in rows:
+        row_labels.append(label)
+        if mask is None:
+            # Section header row -> blank cells
+            out_rows.append(["" for _ in col_groups])
+        else:
+            out_rows.append(
+                [n_pct(col_mask, mask) for col_mask in col_groups.values()]
+            )
+
+    table = pd.DataFrame(out_rows, index=row_labels, columns=col_index)
+    table.index.name = "Attribute"
+
+    # Prepend an "N" row with raw column totals
+    totals = pd.DataFrame(
+        [[int(m.sum()) for m in col_groups.values()]],
+        index=["N (total in column)"],
+        columns=col_index,
+    )
+    table = pd.concat([totals, table])
+
+    return table
+
+
+# ---------------------------------------------------------------------
+# 3. Synthetic demo data (remove/replace once real df is wired in)
+# ---------------------------------------------------------------------
+
+def make_synthetic_df(n: int = 2000, seed: int = 42) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    df = pd.DataFrame({
+        COLUMN_MAP["hai_status"]: rng.choice(["positive", "negative"], n, p=[0.3, 0.7]),
+        COLUMN_MAP["exposure"]: rng.choice(["c_diff", "mrsa", "none"], n, p=[0.15, 0.15, 0.7]),
+        COLUMN_MAP["adrd"]: rng.choice(["positive", "negative"], n, p=[0.2, 0.8]),
+        COLUMN_MAP["race_ethnicity"]: rng.choice(["White", "Non-White"], n, p=[0.6, 0.4]),
+        COLUMN_MAP["sex"]: rng.choice(["Female", "Male"], n, p=[0.55, 0.45]),
+        COLUMN_MAP["age"]: rng.integers(18, 95, n),
+        COLUMN_MAP["svi"]: rng.random(n),
+        COLUMN_MAP["urban"]: rng.choice([True, False], n, p=[0.7, 0.3]),
+        COLUMN_MAP["hospital_size"]: rng.integers(20, 800, n),
+    })
+    return df
+
+
+# ---------------------------------------------------------------------
+# 4. Main
+# ---------------------------------------------------------------------
+
+if __name__ == "__main__":
+    # --- Replace this block with your real dataframe load ---
+    df = make_synthetic_df()
+    # df = pd.read_csv("your_data.csv")
+    # ----------------------------------------------------------
+
+    table2 = build_table(df)
+
+    print(table2.to_string())
+
+    table2.to_csv("table2_descriptive_stats.csv")
+    try:
+        table2.to_excel("table2_descriptive_stats.xlsx", merge_cells=True)
+    except Exception as e:
+        print(f"(Excel export skipped: {e})")
+
+    print("\nSaved: table2_descriptive_stats.csv / .xlsx")
+        print(f"(Excel export skipped: {e})")
+
+    print("\nSaved: table2_descriptive_stats.csv / .xlsx")
