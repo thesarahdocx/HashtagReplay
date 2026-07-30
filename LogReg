@@ -1,0 +1,145 @@
+"""
+Table 3 — Logistic Regression: Outcome ~ Effect + Adjustment set
+=================================================
+ 
+Rows   : VARIABLE1 / VARIABLE2 / VARIABLE3, each as "unadjusted" and "adjusted + balanced"
+Columns: Unstratified / Stratifer1 / Stratifer2
+ 
+- "unadj"    -> simple logistic regression: Outcome ~ ADRD  (no covariates)
+- "adj_bal"  -> logistic regression on covariates + ADRD, run on a dataset
+                that has been balanced by RANDOM MAJORITY UNDERSAMPLING
+                (majority class of the outcome is downsampled to match the
+                minority class 1:1 before the model is fit)
+- Stratification is by xxxxxxx, which is derived from XXXXXXXXX. 
+ 
+Requirements:
+    pip install pandas numpy statsmodels imbalanced-learn scikit-learn
+"""
+ 
+import numpy as np
+import pandas as pd
+import statsmodels.api as sm
+from imblearn.under_sampling import RandomUnderSampler
+ 
+# ----------------------------------------------------------------------
+# 0. CONFIG — edit these to match your dataset
+# ----------------------------------------------------------------------
+ 
+DATA_PATH = "your_data.csv"          # path to the analytic dataset
+OUTCOMES = ["VARIABLE1", "VARIABLE2", "VARIABLE3"]       # binary outcome columns (0/1)
+EXPOSURE = "ADRD"                    # exposure/predictor of interest (0/1)
+ 
+# Covariates to include in the "adjusted" models (edit to your covariate set)
+ADJUST_COVARIATES = [
+    "Covariate1",
+    "Covariate2",
+    "Comorbidity_Index",
+    # add additional confounders here
+]
+
+#Additional Proxies may de defined here
+ 
+# ----------------------------------------------------------------------
+# 1. LOAD DATA
+# ----------------------------------------------------------------------
+ 
+df = pd.read_csv(DATA_PATH)
+ 
+# Derive strata; Example is using hospital size by number of admissions
+df["Stratifer2ity"] = np.where(
+    df[ADMISSIONS_COL] >= ADMISSIONS_CUTOFF, "Urban", "Rural"
+)
+ 
+strata = {
+    "Unstratified": df,
+    "Stratifer1": df[df["Stratifer2ity"] == "Urban"],
+    "Stratifer2": df[df["Stratifer2ity"] == "Rural"],
+}
+ 
+# ----------------------------------------------------------------------
+# 2. HELPER FUNCTIONS
+# ----------------------------------------------------------------------
+ 
+def fit_logit(data: pd.DataFrame, outcome: str, predictors: list):
+    """Fit a logistic regression and return a formatted OR (95% CI), p-value string."""
+    model_df = data[[outcome] + predictors].dropna()
+ 
+    if model_df[outcome].nunique() < 2:
+        return "NA (no outcome variation)"
+ 
+    X = sm.add_constant(model_df[predictors].astype(float))
+    y = model_df[outcome].astype(float)
+ 
+    try:
+        result = sm.Logit(y, X).fit(disp=0)
+    except Exception as e:
+        return f"NA (model failed: {e})"
+ 
+    params = result.params
+    conf = result.conf_int()
+    pvals = result.pvalues
+ 
+    or_val = np.exp(params[EXPOSURE])
+    ci_low, ci_high = np.exp(conf.loc[EXPOSURE])
+    p_val = pvals[EXPOSURE]
+ 
+    return f"OR={or_val:.2f} (95% CI: {ci_low:.2f}-{ci_high:.2f}), p={p_val:.3f}, n={len(model_df)}"
+ 
+#Majority class undersampling for dataframe balance
+
+def balance_majority_undersample(data: pd.DataFrame, outcome: str, predictors: list):
+    """Random majority-class undersampling on `outcome`, returns a balanced dataframe."""
+    model_df = data[[outcome] + predictors].dropna()
+ 
+    X = model_df[predictors]
+    y = model_df[outcome]
+ 
+    rus = RandomUnderSampler(sampling_strategy="auto", random_state=RANDOM_STATE)
+    X_res, y_res = rus.fit_resample(X, y)
+ 
+    balanced = X_res.copy()
+    balanced[outcome] = y_res.values
+    return balanced
+ 
+ 
+def run_unadjusted(data: pd.DataFrame, outcome: str):
+    """Outcome ~ ADRD, no covariates, no balancing."""
+    return fit_logit(data, outcome, [EXPOSURE])
+ 
+ 
+def run_adjusted_balanced(data: pd.DataFrame, outcome: str):
+    """Outcome ~ ADRD + covariates, fit on a majority-undersampled (balanced) dataset."""
+    predictors = [EXPOSURE] + ADJUST_COVARIATES
+    balanced_df = balance_majority_undersample(data, outcome, predictors)
+    return fit_logit(balanced_df, outcome, predictors)
+ 
+ 
+# ----------------------------------------------------------------------
+# 3. BUILD TABLE 3
+# ----------------------------------------------------------------------
+ 
+row_labels = []
+for outcome in OUTCOMES:
+    row_labels.append((outcome, "unadj"))
+    row_labels.append((outcome, "adj_bal"))
+ 
+results = pd.DataFrame(
+    index=[f"{o} ~ ADRD_{m}" for o, m in row_labels],
+    columns=list(strata.keys()),
+    dtype=object,
+)
+ 
+for outcome, method in row_labels:
+    row_name = f"{outcome} ~ ADRD_{method}"
+    for strat_name, strat_df in strata.items():
+        if method == "unadj":
+            results.loc[row_name, strat_name] = run_unadjusted(strat_df, outcome)
+        else:  # adj_bal
+            results.loc[row_name, strat_name] = run_adjusted_balanced(strat_df, outcome)
+ 
+# ----------------------------------------------------------------------
+# 4. OUTPUT
+# ----------------------------------------------------------------------
+ 
+print(results.to_string())
+results.to_csv("table3_logistic_regression_results.csv")
